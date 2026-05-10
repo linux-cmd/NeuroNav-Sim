@@ -15,7 +15,7 @@ WINDOW_WIDTH = 1240
 WINDOW_HEIGHT = 760
 FPS = 60
 
-GRID_CELL_SIZE = 20
+GRID_CELL_SIZE = 10
 GRID_COLS = WORLD_WIDTH // GRID_CELL_SIZE
 GRID_ROWS = WORLD_HEIGHT // GRID_CELL_SIZE
 
@@ -23,6 +23,9 @@ CAMERA_WIDTH = 384
 CAMERA_HEIGHT = 216
 CAMERA_FOV_DEGREES = 70
 CAMERA_RANGE = 260
+CAMERA_RAY_STEP = 2
+MAPPING_RANGE = 300
+MAPPING_RAYS = 180
 
 ROBOT_RADIUS = 12
 ROBOT_SPEED = 95
@@ -55,6 +58,14 @@ class Detection:
     angle: float
     distance: float
     world_point: tuple
+
+
+@dataclass(frozen=True)
+class Level:
+    name: str
+    start: tuple
+    goal: tuple
+    obstacles: tuple
 
 
 def clamp(value, low, high):
@@ -105,7 +116,7 @@ def heuristic(a, b):
     return math.hypot(ar - br, ac - bc)
 
 
-def astar(grid, start, goal):
+def astar(grid, start, goal, allow_unknown=True, unknown_penalty=2.5):
     rows, cols = grid.shape
 
     if start == goal:
@@ -117,7 +128,18 @@ def astar(grid, start, goal):
 
     def blocked(cell):
         r, c = cell
-        return grid[r, c] >= OCCUPIED
+        if grid[r, c] >= OCCUPIED:
+            return True
+
+        return not allow_unknown and grid[r, c] == UNKNOWN
+
+    def traversal_cost(cell):
+        r, c = cell
+
+        if grid[r, c] == UNKNOWN:
+            return unknown_penalty
+
+        return 1.0
 
     directions = [
         (-1, 0, 1.0),
@@ -158,7 +180,17 @@ def astar(grid, start, goal):
             if blocked(next_cell):
                 continue
 
-            new_g = g_score[current] + move_cost
+            if dr != 0 and dc != 0:
+                side_a = (current[0] + dr, current[1])
+                side_b = (current[0], current[1] + dc)
+
+                if not in_bounds(side_a) or not in_bounds(side_b):
+                    continue
+
+                if blocked(side_a) or blocked(side_b):
+                    continue
+
+            new_g = g_score[current] + move_cost * traversal_cost(next_cell)
 
             if new_g < g_score.get(next_cell, float("inf")):
                 came_from[next_cell] = current
@@ -184,6 +216,77 @@ def inflate_obstacles(grid, amount=1):
     return new_grid
 
 
+def make_levels():
+    return [
+        Level(
+            "Training Course",
+            (90.0, 90.0),
+            (720.0, 520.0),
+            (
+                (180, 100, 90, 210),
+                (360, 70, 70, 160),
+                (520, 150, 160, 70),
+                (120, 420, 190, 65),
+                (410, 350, 90, 180),
+                (590, 390, 80, 120),
+            ),
+        ),
+        Level(
+            "Slalom Labyrinth",
+            (70.0, 70.0),
+            (735.0, 530.0),
+            (
+                (120, 0, 24, 370),
+                (290, 230, 24, 370),
+                (460, 0, 24, 370),
+                (630, 230, 24, 370),
+                (680, 45, 50, 120),
+                (45, 455, 120, 34),
+                (340, 455, 65, 34),
+                (625, 345, 105, 34),
+            ),
+        ),
+        Level(
+            "Doorway Maze",
+            (65.0, 535.0),
+            (735.0, 65.0),
+            (
+                (180, 0, 28, 180),
+                (180, 300, 28, 300),
+                (340, 0, 28, 360),
+                (340, 480, 28, 120),
+                (500, 0, 28, 160),
+                (500, 280, 28, 320),
+                (660, 0, 28, 340),
+                (660, 460, 28, 140),
+                (70, 120, 70, 70),
+                (240, 80, 45, 45),
+                (405, 500, 45, 45),
+                (570, 60, 45, 45),
+            ),
+        ),
+        Level(
+            "Problem Solver",
+            (58.0, 58.0),
+            (742.0, 542.0),
+            (
+                (100, 92, 575, 30),
+                (100, 92, 30, 360),
+                (100, 422, 445, 30),
+                (515, 215, 30, 237),
+                (225, 215, 320, 30),
+                (225, 215, 30, 130),
+                (345, 322, 275, 30),
+                (620, 322, 30, 150),
+                (675, 92, 30, 350),
+                (35, 510, 300, 30),
+                (430, 510, 260, 30),
+                (720, 195, 35, 230),
+            ),
+        ),
+    ]
+
+
 class NeuroNavSim:
     def __init__(self):
         pygame.init()
@@ -199,10 +302,16 @@ class NeuroNavSim:
 
         self.world_offset = (20, 20)
 
-        self.robot_pos = np.array([90.0, 90.0])
+        self.levels = make_levels()
+        self.current_level_index = 0
+        self.current_level = self.levels[self.current_level_index]
+
+        self.robot_pos = np.array(self.current_level.start, dtype=float)
         self.robot_heading = 0.0
 
-        self.goal = np.array([720.0, 520.0])
+        self.goal = np.array(self.current_level.goal, dtype=float)
+        self.active_target = self.goal.copy()
+        self.exploring = False
 
         self.grid = np.full((GRID_ROWS, GRID_COLS), UNKNOWN, dtype=np.int16)
 
@@ -216,7 +325,7 @@ class NeuroNavSim:
         self.explanation = "The robot is scanning, mapping, planning, and moving."
 
         self.last_plan_time = 0
-        self.replan_delay = 0.35
+        self.replan_delay = 0.55
 
         self.goal_reached = False
         self.obstacles = self.make_obstacles()
@@ -224,19 +333,20 @@ class NeuroNavSim:
         self.mark_robot_area_free()
 
     def make_obstacles(self):
-        return [
-            pygame.Rect(180, 100, 90, 210),
-            pygame.Rect(360, 70, 70, 160),
-            pygame.Rect(520, 150, 160, 70),
-            pygame.Rect(120, 420, 190, 65),
-            pygame.Rect(410, 350, 90, 180),
-            pygame.Rect(590, 390, 80, 120),
-        ]
+        return [pygame.Rect(*obstacle) for obstacle in self.current_level.obstacles]
+
+    def load_level(self, index):
+        self.current_level_index = index % len(self.levels)
+        self.current_level = self.levels[self.current_level_index]
+        self.obstacles = self.make_obstacles()
+        self.reset()
 
     def reset(self):
-        self.robot_pos = np.array([90.0, 90.0])
+        self.robot_pos = np.array(self.current_level.start, dtype=float)
         self.robot_heading = 0.0
-        self.goal = np.array([720.0, 520.0])
+        self.goal = np.array(self.current_level.goal, dtype=float)
+        self.active_target = self.goal.copy()
+        self.exploring = False
 
         self.grid = np.full((GRID_ROWS, GRID_COLS), UNKNOWN, dtype=np.int16)
 
@@ -244,9 +354,10 @@ class NeuroNavSim:
         self.path_world = []
         self.detections = []
 
-        self.status = "Reset"
+        self.status = f"Level {self.current_level_index + 1}: {self.current_level.name}"
         self.explanation = "The robot cleared its map and started over."
         self.goal_reached = False
+        self.last_plan_time = 0
 
         self.mark_robot_area_free()
 
@@ -263,16 +374,48 @@ class NeuroNavSim:
         return False
 
     def robot_hits_obstacle(self, pos):
-        for angle in np.linspace(0, 2 * math.pi, 16):
+        return self.collision_point(pos) is not None
+
+    def collision_point(self, pos):
+        for angle in np.linspace(0, 2 * math.pi, 24, endpoint=False):
             point = np.array([
                 pos[0] + math.cos(angle) * ROBOT_RADIUS,
                 pos[1] + math.sin(angle) * ROBOT_RADIUS,
             ])
 
             if self.point_hits_obstacle(point):
-                return True
+                return point
 
-        return False
+        return None
+
+    def cell_overlaps_obstacle(self, cell):
+        row, col = cell
+        rect = pygame.Rect(
+            col * GRID_CELL_SIZE,
+            row * GRID_CELL_SIZE,
+            GRID_CELL_SIZE,
+            GRID_CELL_SIZE,
+        )
+
+        return any(rect.colliderect(obstacle) for obstacle in self.obstacles)
+
+    def cell_center_hits_obstacle(self, cell):
+        return self.point_hits_obstacle(cell_to_world(cell))
+
+    def mark_free_cell(self, cell):
+        row, col = cell
+
+        if not (0 <= row < GRID_ROWS and 0 <= col < GRID_COLS):
+            return
+
+        if self.grid[row, col] == OCCUPIED:
+            return
+
+        if self.cell_center_hits_obstacle(cell):
+            self.grid[row, col] = OCCUPIED
+            return
+
+        self.grid[row, col] = FREE
 
     def ray_cast(self, origin, angle, max_range=CAMERA_RANGE):
         for d in range(0, max_range, 4):
@@ -299,7 +442,7 @@ class NeuroNavSim:
         fov = math.radians(CAMERA_FOV_DEGREES)
         horizon = CAMERA_HEIGHT // 2
 
-        for x in range(CAMERA_WIDTH):
+        for x in range(0, CAMERA_WIDTH, CAMERA_RAY_STEP):
             percent = x / max(1, CAMERA_WIDTH - 1)
             ray_angle = self.robot_heading - fov / 2 + percent * fov
 
@@ -315,7 +458,7 @@ class NeuroNavSim:
             brightness = int(clamp(255 - hit_distance * 0.45, 90, 255))
             color = (brightness, 40, 45)
 
-            cv2.line(frame, (x, y1), (x, y2), color, 2)
+            cv2.line(frame, (x, y1), (x, y2), color, CAMERA_RAY_STEP + 1)
 
         cv2.putText(
             frame,
@@ -366,19 +509,18 @@ class NeuroNavSim:
             image_percent = center_x / CAMERA_WIDTH
 
             relative_angle = -fov / 2 + image_percent * fov
-            estimated_distance = clamp(15000 / max(h, 1), 25, CAMERA_RANGE)
-
             world_angle = self.robot_heading + relative_angle
+            hit_distance, hit_point = self.ray_cast(self.robot_pos, world_angle, CAMERA_RANGE)
 
-            wx = self.robot_pos[0] + math.cos(world_angle) * estimated_distance
-            wy = self.robot_pos[1] + math.sin(world_angle) * estimated_distance
+            if hit_distance is None:
+                continue
 
             detections.append(
                 Detection(
                     bbox=(x, y, w, h),
                     angle=relative_angle,
-                    distance=estimated_distance,
-                    world_point=(wx, wy),
+                    distance=hit_distance,
+                    world_point=hit_point,
                 )
             )
 
@@ -399,14 +541,17 @@ class NeuroNavSim:
 
     def mark_robot_area_free(self):
         robot_cell = world_to_cell(self.robot_pos)
+        cell_radius = math.ceil((ROBOT_RADIUS + GRID_CELL_SIZE) / GRID_CELL_SIZE)
 
-        for dr in range(-2, 3):
-            for dc in range(-2, 3):
+        for dr in range(-cell_radius, cell_radius + 1):
+            for dc in range(-cell_radius, cell_radius + 1):
                 row = robot_cell[0] + dr
                 col = robot_cell[1] + dc
 
-                if 0 <= row < GRID_ROWS and 0 <= col < GRID_COLS:
-                    self.grid[row, col] = FREE
+                cell_center = cell_to_world((row, col))
+
+                if distance(cell_center, self.robot_pos) <= ROBOT_RADIUS + GRID_CELL_SIZE:
+                    self.mark_free_cell((row, col))
 
     def mark_ray_free(self, angle, max_distance):
         d = 0
@@ -418,56 +563,374 @@ class NeuroNavSim:
 
             row, col = world_to_cell((x, y))
 
-            if self.grid[row, col] != OCCUPIED:
-                self.grid[row, col] = FREE
+            self.mark_free_cell((row, col))
 
             d += step
 
+    def mark_obstacle_hit(self, point):
+        hit_cell = world_to_cell(point)
+
+        if self.cell_center_hits_obstacle(hit_cell):
+            self.grid[hit_cell] = OCCUPIED
+            return
+
+        best_cell = None
+        best_distance = float("inf")
+
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                row = hit_cell[0] + dr
+                col = hit_cell[1] + dc
+
+                if not (0 <= row < GRID_ROWS and 0 <= col < GRID_COLS):
+                    continue
+
+                candidate = (row, col)
+
+                if not self.cell_center_hits_obstacle(candidate):
+                    continue
+
+                candidate_distance = distance(cell_to_world(candidate), point)
+
+                if candidate_distance < best_distance:
+                    best_cell = candidate
+                    best_distance = candidate_distance
+
+        if best_cell is not None:
+            self.grid[best_cell] = OCCUPIED
+        else:
+            self.grid[hit_cell] = OCCUPIED
+
+    def detection_to_ray_hit(self, detection):
+        world_angle = self.robot_heading + detection.angle
+        hit_distance, hit_point = self.ray_cast(self.robot_pos, world_angle, CAMERA_RANGE)
+
+        if hit_distance is None:
+            return None, None
+
+        return hit_distance, hit_point
+
     def update_map(self, detections):
-        fov = math.radians(CAMERA_FOV_DEGREES)
+        for i in range(MAPPING_RAYS):
+            ray_angle = self.robot_heading + (i / MAPPING_RAYS) * math.tau
 
-        for i in range(31):
-            percent = i / 30
-            relative_angle = -fov / 2 + percent * fov
-            world_angle = self.robot_heading + relative_angle
+            hit_distance, hit_point = self.ray_cast(self.robot_pos, ray_angle, MAPPING_RANGE)
+            free_distance = MAPPING_RANGE if hit_distance is None else max(0, hit_distance - GRID_CELL_SIZE / 2)
 
-            self.mark_ray_free(world_angle, CAMERA_RANGE * 0.75)
+            self.mark_ray_free(ray_angle, free_distance)
+
+            if hit_distance is not None:
+                self.mark_obstacle_hit(hit_point)
 
         for detection in detections:
+            hit_distance, hit_point = self.detection_to_ray_hit(detection)
+
+            if hit_distance is None:
+                continue
+
             world_angle = self.robot_heading + detection.angle
-
-            self.mark_ray_free(world_angle, max(0, detection.distance - GRID_CELL_SIZE))
-
-            row, col = world_to_cell(detection.world_point)
-
-            for dr in range(-1, 2):
-                for dc in range(-1, 2):
-                    rr = row + dr
-                    cc = col + dc
-
-                    if 0 <= rr < GRID_ROWS and 0 <= cc < GRID_COLS:
-                        self.grid[rr, cc] = OCCUPIED
+            self.mark_ray_free(world_angle, max(0, hit_distance - GRID_CELL_SIZE / 2))
+            self.mark_obstacle_hit(hit_point)
 
         self.mark_robot_area_free()
+
+    def neighbors8(self, cell):
+        row, col = cell
+
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+
+                rr = row + dr
+                cc = col + dc
+
+                if 0 <= rr < GRID_ROWS and 0 <= cc < GRID_COLS:
+                    yield rr, cc
+
+    def is_frontier_cell(self, cell):
+        row, col = cell
+
+        if self.grid[row, col] != FREE:
+            return False
+
+        return any(self.grid[rr, cc] == UNKNOWN for rr, cc in self.neighbors8(cell))
+
+    def frontier_information_gain(self, cell):
+        gain = 0
+
+        for rr, cc in self.neighbors8(cell):
+            if self.grid[rr, cc] == UNKNOWN:
+                gain += 1
+
+        return gain
+
+    def reachable_paths(self, grid, start):
+        rows, cols = grid.shape
+
+        def in_bounds(cell):
+            r, c = cell
+            return 0 <= r < rows and 0 <= c < cols
+
+        def blocked(cell):
+            r, c = cell
+            return grid[r, c] >= OCCUPIED or grid[r, c] == UNKNOWN
+
+        directions = [
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, 1.414),
+            (-1, 1, 1.414),
+            (1, -1, 1.414),
+            (1, 1, 1.414),
+        ]
+
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+
+        came_from = {}
+        cost_so_far = {start: 0}
+
+        while open_set:
+            current_cost, current = heapq.heappop(open_set)
+
+            if current_cost > cost_so_far[current]:
+                continue
+
+            for dr, dc, move_cost in directions:
+                next_cell = (current[0] + dr, current[1] + dc)
+
+                if not in_bounds(next_cell) or blocked(next_cell):
+                    continue
+
+                if dr != 0 and dc != 0:
+                    side_a = (current[0] + dr, current[1])
+                    side_b = (current[0], current[1] + dc)
+
+                    if not in_bounds(side_a) or not in_bounds(side_b):
+                        continue
+
+                    if blocked(side_a) or blocked(side_b):
+                        continue
+
+                new_cost = current_cost + move_cost
+
+                if new_cost < cost_so_far.get(next_cell, float("inf")):
+                    cost_so_far[next_cell] = new_cost
+                    came_from[next_cell] = current
+                    heapq.heappush(open_set, (new_cost, next_cell))
+
+        return cost_so_far, came_from
+
+    def rebuild_reachable_path(self, came_from, start, goal):
+        if goal == start:
+            return [start]
+
+        if goal not in came_from:
+            return []
+
+        path = [goal]
+        current = goal
+
+        while current != start:
+            current = came_from[current]
+            path.append(current)
+
+        path.reverse()
+        return path
+
+    def choose_frontier(self, planning_grid, start):
+        reachable_costs, came_from = self.reachable_paths(planning_grid, start)
+        candidates = []
+
+        for row in range(GRID_ROWS):
+            for col in range(GRID_COLS):
+                cell = (row, col)
+
+                if cell == start or cell not in reachable_costs:
+                    continue
+
+                if not self.is_frontier_cell(cell):
+                    continue
+
+                if planning_grid[cell] >= OCCUPIED:
+                    continue
+
+                world = cell_to_world(cell)
+                dist_to_goal = distance(world, self.goal)
+                info_gain = self.frontier_information_gain(cell)
+                path_cost = reachable_costs[cell] * GRID_CELL_SIZE
+                score = dist_to_goal + path_cost * 0.35 - info_gain * GRID_CELL_SIZE * 1.8
+
+                candidates.append((score, cell))
+
+        if not candidates:
+            return None, []
+
+        candidates.sort(key=lambda item: item[0])
+        _, cell = candidates[0]
+        path = self.rebuild_reachable_path(came_from, start, cell)
+
+        return cell, path
+
+    def smooth_path(self, path, planning_grid):
+        if len(path) <= 2:
+            return path
+
+        smoothed = [path[0]]
+        anchor_index = 0
+
+        while anchor_index < len(path) - 1:
+            next_index = len(path) - 1
+
+            while next_index > anchor_index + 1:
+                if self.grid_line_walkable(path[anchor_index], path[next_index], planning_grid):
+                    break
+
+                next_index -= 1
+
+            smoothed.append(path[next_index])
+            anchor_index = next_index
+
+        return smoothed
+
+    def segment_is_physically_clear(self, start, goal):
+        start_pos = cell_to_world(start)
+        goal_pos = cell_to_world(goal)
+        span = distance(start_pos, goal_pos)
+        steps = max(1, int(span / max(2, ROBOT_RADIUS / 2)))
+
+        for i in range(steps + 1):
+            t = i / steps
+            point = start_pos + (goal_pos - start_pos) * t
+
+            if self.collision_point(point) is not None:
+                return False
+
+        return True
+
+    def grid_line_walkable(self, start, goal, planning_grid):
+        start_pos = cell_to_world(start)
+        goal_pos = cell_to_world(goal)
+        span = distance(start_pos, goal_pos)
+        steps = max(1, int(span / (GRID_CELL_SIZE / 2)))
+
+        for i in range(steps + 1):
+            t = i / steps
+            point = start_pos + (goal_pos - start_pos) * t
+            cell = world_to_cell(point)
+
+            if planning_grid[cell] >= OCCUPIED or planning_grid[cell] == UNKNOWN:
+                return False
+
+        return self.segment_is_physically_clear(start, goal)
+
+    def commit_path(self, path, planning_grid, status, explanation, exploring=False, target=None, smooth=True):
+        self.exploring = exploring
+        self.active_target = self.goal.copy() if target is None else np.array(target, dtype=float)
+        self.path = self.smooth_path(path, planning_grid) if smooth else path
+        self.path_world = [cell_to_world(cell) for cell in self.path]
+        self.status = status
+        self.explanation = explanation
+
+    def make_footprint_grid(self, source_grid):
+        footprint_grid = source_grid.copy()
+
+        for row in range(GRID_ROWS):
+            for col in range(GRID_COLS):
+                cell = (row, col)
+
+                if source_grid[cell] == UNKNOWN:
+                    continue
+
+                if self.collision_point(cell_to_world(cell)) is not None:
+                    footprint_grid[cell] = OCCUPIED
+
+        return footprint_grid
 
     def plan_path(self):
         start = world_to_cell(self.robot_pos)
         goal = world_to_cell(self.goal)
 
-        planning_grid = inflate_obstacles(self.grid, amount=1)
+        safe_grid = inflate_obstacles(self.grid, amount=1)
 
-        planning_grid[start] = FREE
-        planning_grid[goal] = FREE
+        safe_grid[start] = FREE
+        safe_grid[goal] = FREE
 
-        self.path = astar(planning_grid, start, goal)
-        self.path_world = [cell_to_world(cell) for cell in self.path]
+        path = astar(safe_grid, start, goal, allow_unknown=False)
 
-        if self.path:
-            self.status = "Path found"
-            self.explanation = "A* found a route through the map."
+        if path:
+            self.commit_path(
+                path,
+                safe_grid,
+                "Goal route found",
+                "The planner found a collision-buffered route through mapped free space.",
+            )
+            return
+
+        frontier, path = self.choose_frontier(safe_grid, start)
+
+        if path:
+            self.commit_path(
+                path,
+                safe_grid,
+                "Exploring frontier",
+                "The final route is still uncertain, so the robot is moving to the most useful mapped frontier.",
+                exploring=True,
+                target=cell_to_world(frontier),
+            )
+            return
+
+        narrow_grid = self.make_footprint_grid(self.grid)
+        narrow_grid[start] = FREE
+        narrow_grid[goal] = FREE
+        path = astar(narrow_grid, start, goal, allow_unknown=False)
+
+        if path:
+            self.commit_path(
+                path,
+                narrow_grid,
+                "Narrow corridor route",
+                "The safe buffer was too wide for this passage, so the robot is using a tighter collision-checked route.",
+                smooth=False,
+            )
+            return
+
+        frontier, path = self.choose_frontier(narrow_grid, start)
+
+        if path:
+            self.commit_path(
+                path,
+                narrow_grid,
+                "Narrow frontier route",
+                "The safe buffer blocked a small corridor, so the robot is carefully exploring through the tighter passage.",
+                exploring=True,
+                target=cell_to_world(frontier),
+                smooth=False,
+            )
+            return
+
+        optimistic_grid = self.make_footprint_grid(self.grid)
+        optimistic_grid[start] = FREE
+        optimistic_grid[goal] = FREE
+        path = astar(optimistic_grid, start, goal, allow_unknown=True, unknown_penalty=4.5)
+
+        if path:
+            self.commit_path(
+                path,
+                optimistic_grid,
+                "Cautious probe",
+                "No clean frontier was reachable, so the robot is probing the lowest-risk unknown corridor.",
+                exploring=True,
+                smooth=False,
+            )
         else:
+            self.path = []
+            self.path_world = []
             self.status = "No path found"
-            self.explanation = "The robot needs a safer route or more mapped space."
+            self.explanation = "The mapped space is sealed off or the goal is blocked."
 
     def move_robot(self, dt):
         if self.goal_reached:
@@ -501,21 +964,25 @@ class NeuroNavSim:
 
         alignment = max(0.0, math.cos(heading_error))
         speed = ROBOT_SPEED * alignment
+        step_distance = min(speed * dt, max(0, distance(self.robot_pos, target) - 2))
 
         next_pos = self.robot_pos + np.array([
-            math.cos(self.robot_heading) * speed * dt,
-            math.sin(self.robot_heading) * speed * dt,
+            math.cos(self.robot_heading) * step_distance,
+            math.sin(self.robot_heading) * step_distance,
         ])
 
-        if not self.robot_hits_obstacle(next_pos):
+        contact = self.collision_point(next_pos)
+
+        if contact is None:
             self.robot_pos = next_pos
             self.explanation = "The robot is following the next waypoint."
         else:
-            hit_cell = world_to_cell(next_pos)
-            self.grid[hit_cell] = OCCUPIED
+            self.mark_obstacle_hit(contact)
+            self.path = []
+            self.path_world = []
 
             self.status = "Blocked, replanning"
-            self.explanation = "The robot found a blocked move and recalculated the path."
+            self.explanation = "The robot marked the wall contact point and recalculated a safer route."
 
             self.plan_path()
 
@@ -531,6 +998,12 @@ class NeuroNavSim:
                 self.explanation = "A new goal was placed."
                 self.plan_path()
                 return
+
+    def next_level(self):
+        self.load_level(self.current_level_index + 1)
+
+    def previous_level(self):
+        self.load_level(self.current_level_index - 1)
 
     def handle_events(self):
         for event in pygame.event.get():
@@ -549,6 +1022,15 @@ class NeuroNavSim:
 
                 if event.key == pygame.K_g:
                     self.randomize_goal()
+
+                if event.key == pygame.K_n:
+                    self.next_level()
+
+                if event.key == pygame.K_p:
+                    self.previous_level()
+
+                if pygame.K_1 <= event.key <= pygame.K_4:
+                    self.load_level(event.key - pygame.K_1)
 
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
@@ -678,6 +1160,12 @@ class NeuroNavSim:
 
         self.draw_text("GOAL", goal_screen[0] + 14, goal_screen[1] - 10, self.font_small, GREEN)
 
+        if self.exploring:
+            target_screen = (ox + int(self.active_target[0]), oy + int(self.active_target[1]))
+            pygame.draw.circle(self.screen, YELLOW, target_screen, 8)
+            pygame.draw.circle(self.screen, WHITE, target_screen, 8, 1)
+            self.draw_text("SCAN", target_screen[0] + 12, target_screen[1] - 10, self.font_small, YELLOW)
+
         pygame.draw.circle(self.screen, BLUE, robot_screen, ROBOT_RADIUS)
         pygame.draw.circle(self.screen, WHITE, robot_screen, ROBOT_RADIUS, 2)
 
@@ -695,7 +1183,7 @@ class NeuroNavSim:
             pygame.draw.circle(self.screen, YELLOW, (ox + int(wx), oy + int(wy)), 5)
 
         self.draw_text(
-            "World View: robot, obstacles, camera FOV, A* path, and goal",
+            "World View: robot, obstacles, camera FOV, planned route, frontier target, and goal",
             ox + 14,
             oy + WORLD_HEIGHT + 10,
             self.font_small,
@@ -758,6 +1246,9 @@ class NeuroNavSim:
                 )
 
         for row, col in self.path:
+            if self.grid[row, col] >= OCCUPIED:
+                continue
+
             pygame.draw.rect(
                 self.screen,
                 CYAN,
@@ -797,17 +1288,26 @@ class NeuroNavSim:
         x = rect.x + 15
         y = rect.y + 42
 
+        self.draw_text(
+            f"Level: {self.current_level_index + 1}/{len(self.levels)} {self.current_level.name}",
+            x,
+            y,
+            self.font_small,
+            WHITE,
+        )
+        y += 22
+
         self.draw_text(f"Status: {self.status}", x, y, self.font_small, WHITE)
-        y += 24
+        y += 22
 
         self.draw_text(
-            f"Heading: {math.degrees(self.robot_heading):.1f} deg",
+            f"Mode: {'explore' if self.exploring else 'goal'} | Heading: {math.degrees(self.robot_heading):.1f} deg",
             x,
             y,
             self.font_small,
             MUTED,
         )
-        y += 22
+        y += 20
 
         self.draw_text(
             f"Path cells: {len(self.path)}",
@@ -816,7 +1316,7 @@ class NeuroNavSim:
             self.font_small,
             MUTED,
         )
-        y += 22
+        y += 20
 
         known = np.count_nonzero(self.grid != UNKNOWN)
         total = self.grid.size
@@ -829,7 +1329,7 @@ class NeuroNavSim:
             self.font_small,
             MUTED,
         )
-        y += 27
+        y += 24
 
         self.draw_wrapped_text(
             self.explanation,
@@ -854,8 +1354,8 @@ class NeuroNavSim:
         )
 
         self.draw_text(
-            "SPACE: force replan",
-            rect.x + 300,
+            "SPACE: replan",
+            rect.x + 265,
             rect.y + 42,
             self.font_small,
             WHITE,
@@ -863,16 +1363,24 @@ class NeuroNavSim:
 
         self.draw_text(
             "G: random goal",
-            rect.x + 500,
+            rect.x + 425,
             rect.y + 42,
             self.font_small,
             WHITE,
         )
 
         self.draw_text(
-            "R: reset",
-            rect.x + 650,
+            "N/P: level",
+            rect.x + 580,
             rect.y + 42,
+            self.font_small,
+            WHITE,
+        )
+
+        self.draw_text(
+            "R: reset | 1-4: jump",
+            rect.x + 15,
+            rect.y + 64,
             self.font_small,
             WHITE,
         )
@@ -881,7 +1389,7 @@ class NeuroNavSim:
         self.draw_text("NeuroNav-Sim", 20, 725, self.font_big, WHITE)
 
         self.draw_text(
-            "camera -> CV -> map -> A* -> movement",
+            "camera + range scan -> map -> frontier/A* -> movement",
             235,
             732,
             self.font_small,
